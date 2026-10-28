@@ -76,40 +76,43 @@ for z = 1:nZ
     sangre(:,:,z) = segmentar(cf(:,:,z), ref(z), interior(:,:,z), P);
 end
 
-%% ---------- 6) EVALUACIÓN CON DICE ----------
-% conMask(z) = true si los médicos marcaron algo en el corte z
-conMask = squeeze(any(any(mask, 1), 2));
+% ---------- 6) EVALUACIÓN CON DICE ----------
+conMask = squeeze(any(any(mask, 1), 2));   % cortes donde los médicos marcaron hemorragia
 
-% Dice por corte (solo en cortes con hemorragia real)
-diceZ = nan(nZ, 1);
-for z = 1:nZ
-    if conMask(z), diceZ(z) = dice_bin(sangre(:,:,z), mask(:,:,z)); end
+dice3D = 2*sum(sangre(:) & mask(:)) / max(sum(sangre(:)) + sum(mask(:)), 1);
+
+% Dice por corte (solo cortes con hemorragia)
+diceZ = zeros(nZ, 1);
+for z = find(conMask)'
+    S = sangre(:,:,z);  M = mask(:,:,z);
+    diceZ(z) = 2*sum(S(:) & M(:)) / max(sum(S(:)) + sum(M(:)), 1);
 end
 
-fprintf('\nDice 3D (volumen completo):          %.3f\n', dice_bin(sangre, mask));
-fprintf('Dice promedio (cortes con hemorr.):  %.3f\n', mean(diceZ, 'omitnan'));
+fprintf('\nDice 3D (volumen completo):          %.3f\n', dice3D);
+fprintf('Dice promedio (cortes con hemorr.):  %.3f\n', mean(diceZ(conMask)));
 fprintf('Voxeles: nuestro=%d, medicos=%d, acierto=%d\n', ...
     nnz(sangre), nnz(mask), nnz(sangre & mask));
-% Si nuestro >> medicos: agarramos de más (subí delta). Si nuestro << medicos: falta sangre (bajá delta).
 
 figure
-plot(find(~isnan(diceZ)), diceZ(~isnan(diceZ)), 'o-');
-xlabel('Corte'); ylabel('Dice'); title('Dice por corte'); grid on
+plot(find(conMask), diceZ(conMask), 'o-');
+xlabel('Corte'); 
+ylabel('Dice'); 
+title('Dice por corte'); 
+grid on
 
-%% ---------- 7) (OPCIONAL) BARRIDO RÁPIDO DE DELTA ----------
-% Es rápido porque cf, ref e interior ya están calculados; solo repite el umbral.
-barrer = true;   % ponelo en false para saltear esta sección
+%% ---------- 7) BARRIDO RÁPIDO DE DELTA ----------
+barrer = true;   % poner en false para saltear esta sección
 if barrer
-    deltas = 5:5:40;                    % valores de DELTA a probar
-    dd = nan(size(deltas));             % Dice 3D para cada DELTA
+    deltas = 5:5:40;
+    dd = zeros(size(deltas));
     for i = 1:numel(deltas)
-        Q = P;  
-        Q.delta = deltas(i);    % copia de parámetros con otro delta
+        Q = P;  Q.delta = deltas(i);
         S = false(size(CT));
-        for z = find(conMask)'          % solo cortes con hemorragia, para ir más rápido
+        for z = find(conMask)'
             S(:,:,z) = segmentar(cf(:,:,z), ref(z), interior(:,:,z), Q);
         end
-        dd(i) = dice_bin(S(:,:,conMask), mask(:,:,conMask));
+        A = S(:,:,conMask);  B = mask(:,:,conMask);
+        dd(i) = 2*sum(A(:) & B(:)) / max(sum(A(:)) + sum(B(:)), 1);
         fprintf('delta = %2d -> Dice = %.3f\n', deltas(i), dd(i));
     end
     figure, plot(deltas, dd, 'o-'); grid on
@@ -139,7 +142,10 @@ uicontrol('Style','slider','Min',1,'Max',nZ,'Value',z0, ...
     'Position',[0.2 0.02 0.6 0.04], ...
     'Callback', @(s,~) actualizar(f, round(s.Value)));
 actualizar(f, z0);   % dibujo el corte inicial
-
+reconstruir3D_suave('craneo')       % craneo, desde CT.nii
+reconstruir3D_suave('cerebro')      % cerebro, desde el volumen sin craneo
+reconstruir3D_suave('hemorragia')   % lo que marco el medico (ICH_mask.nii)
+reconstruir3D_suave('todo')         % las tres juntas
 %% ============ FUNCIONES LOCALES ============
 
 function sangre = segmentar(cf, ref, interior, P)
@@ -158,13 +164,6 @@ function sangre = segmentar(cf, ref, interior, P)
     sangre = imfill(sangre, 'holes');
     % Descarto objetos más chicos que minArea
     sangre = bwareaopen(sangre, P.minArea);
-end
-
-function d = dice_bin(A, B)
-    % Coeficiente de Dice: 2*|A∩B| / (|A|+|B|). 1 = perfecto, 0 = nada en común.
-    A = logical(A); B = logical(B);
-    den = nnz(A) + nnz(B);
-    if den == 0, d = NaN; else, d = 2*nnz(A & B) / den; end   % NaN si ambos están vacíos
 end
 
 function actualizar(f, z)
