@@ -1,35 +1,29 @@
-function reconstruir3D_suave(tipo, carpeta)
+function reconstruir3D_suave(tipo, archCT, archMask, cerebroBW)
 % RECONSTRUIR3D_SUAVE  Reconstruccion 3D lisa (sin efecto "capas") con contornos Canny.
 %
-%   reconstruir3D_suave('craneo')       -> craneo   (CT.nii)
-%   reconstruir3D_suave('cerebro')      -> cerebro  (CQ500-CT-4_brain.nii)
-%   reconstruir3D_suave('hemorragia')   -> mascara del medico (ICH_mask.nii)
-%   reconstruir3D_suave('todo')         -> las tres juntas
-%   reconstruir3D_suave(tipo, carpeta)  -> si los .nii estan en otra carpeta
+%   reconstruir3D_suave(tipo, archCT, archMask, cerebroBW)
+%     tipo      : 'craneo', 'cerebro', 'hemorragia' o 'todo'
+%     archCT    : ruta al CT del paciente (.nii o .nii.gz)
+%     archMask  : ruta a la mascara de los medicos
+%     cerebroBW : volumen logico del cerebro (la variable "interior" del script)
+%
+% Ejemplo desde PruebaTPFINAL_v2:
+%   reconstruir3D_suave('todo', archCT, archMask, interior)
 %
 % Requiere Image Processing Toolbox (imresize3, imgaussfilt3, edge3: R2018b o mas nuevo).
 
     %% ---------- PARAMETROS ----------
     P.huesoHU     = 150;        % umbral de hueso (HU)
     P.paso        = 2;          % 1 = maxima calidad (mas lento), 2 = recomendado, 3 = rapido
-    P.sigma       = 1.5;        % suavizado de la superficie (en voxeles nuevos). Mas alto = mas liso
+    P.sigma       = 1.5;        % suavizado de la superficie. Mas alto = mas liso
     P.sigmaHem    = 1.0;        % suavizado de la hemorragia (menor para no borrarla)
     P.caras       = 0.5;        % fraccion de caras que se conservan
 
     P.canny       = true;       % true = resalta contornos con Canny 3D
-    P.cannyUmbral = [0.10 0.25];% umbrales [bajo alto] de Canny (0..1). Subilos si hay mucho ruido
+    P.cannyUmbral = [0.10 0.25];% umbrales [bajo alto] de Canny (0..1)
     P.cannySigma  = 1.5;        % suavizado previo de Canny
     P.fuerza      = 0.85;       % que tan oscuros se ven los contornos (0..1)
-    P.profund     = 2;          % en el cerebro, mira Canny "unos voxeles adentro" de la superficie
-
-    %% ---------- RUTAS ----------
-    if nargin < 2
-        carpeta = fileparts(mfilename('fullpath'));
-        if isempty(carpeta), carpeta = pwd; end
-    end
-    archCT    = fullfile(carpeta, 'CT.nii');
-    archBrain = fullfile(carpeta, 'CQ500-CT-4_brain.nii');
-    archMask  = fullfile(carpeta, 'ICH_mask.nii');
+    P.profund     = 2;          % mira Canny "unos voxeles adentro" de la superficie
 
     tipo = lower(tipo);
     if ~ismember(tipo, {'craneo','cerebro','hemorragia','todo'})
@@ -41,7 +35,7 @@ function reconstruir3D_suave(tipo, carpeta)
     info    = niftiinfo(archCT);
     vox     = info.PixelDimensions(1:3);   vox = vox([2 1 3]);
     sz      = info.ImageSize(1:3);         sz  = sz([2 1 3]);
-    h       = mean(vox(1:2)) * P.paso;                 % lado del voxel nuevo (mm)
+    h       = mean(vox(1:2)) * P.paso;     % lado del voxel nuevo (mm)
     newSize = max(round(sz .* vox / h), 4);
 
     figure('Color','k','Name',['3D suave: ' tipo]);
@@ -49,7 +43,7 @@ function reconstruir3D_suave(tipo, carpeta)
 
     %% ---------- CRANEO ----------
     if ismember(tipo, {'craneo','todo'})
-        CT = leer(archCT);
+        CT = leerCT(archCT);
         BW = mayorObjeto(CT > P.huesoHU);
         if strcmp(tipo,'craneo'), alfa = 1; else, alfa = 0.08; end
         dibujar(BW, CT, [0 1000], [0.92 0.92 0.85], alfa, P.sigma, 0, newSize, P);
@@ -58,16 +52,11 @@ function reconstruir3D_suave(tipo, carpeta)
 
     %% ---------- CEREBRO ----------
     if ismember(tipo, {'cerebro','todo'})
-        B  = leer(archBrain);
-        BW = false(size(B));
-        for z = 1:size(B,3)
-            BW(:,:,z) = imfill(B(:,:,z) > 0, 'holes');
-        end
-        BW = mayorObjeto(BW);
-        if P.canny, CTc = leer(archCT); else, CTc = []; end   % Canny sobre el CT en ventana de cerebro
+        BW = mayorObjeto(permute(cerebroBW, [2 1 3]));
+        if P.canny, CTc = leerCT(archCT); else, CTc = []; end
         if strcmp(tipo,'cerebro'), alfa = 1; else, alfa = 0.25; end
         dibujar(BW, CTc, [0 80], [0.90 0.60 0.65], alfa, P.sigma, P.profund, newSize, P);
-        clear B BW CTc
+        clear BW CTc
     end
 
     %% ---------- HEMORRAGIA ----------
@@ -87,9 +76,12 @@ end
 
 %% ============ FUNCIONES LOCALES ============
 
-function V = leer(arch)
-    % Lee el .nii y lo deja en orden [Y X Z]
-    V = permute(single(niftiread(arch)), [2 1 3]);
+function V = leerCT(arch)
+    % Lee el CT, lo pasa a HU y lo deja en orden [Y X Z]
+    info = niftiinfo(arch);
+    m = info.MultiplicativeScaling;  if m == 0, m = 1; end
+    V = single(niftiread(arch)) * m + info.AdditiveOffset;
+    V = permute(V, [2 1 3]);
 end
 
 function BW = mayorObjeto(BW)
