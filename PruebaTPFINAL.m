@@ -1,179 +1,202 @@
-%% ============================================================
-%  SEGMENTACIÓN DE HEMORRAGIA EN VOLUMEN NIfTI (método relativo)
-%  Idea: en cada corte, la sangre es lo que es más claro que el
-%  cerebro "típico" de ESE corte (mediana) + un margen DELTA.
-%  Después se limpia con morfología y se compara con la máscara
-%  de los médicos usando el coeficiente de Dice.
-%% ============================================================
-% clear; clc; close all      % limpio variables, consola y figuras
+%% TP Final PDI - Segmentacion de hemorragia en CT (Seg-CQ500, NIfTI)
+% Metodo relativo: en cada corte, la sangre es lo que es mas claro que el
+% cerebro tipico de ESE corte (mediana) + un margen DELTA.
+% Despues se limpia con morfologia y se compara con la mascara de los
+% medicos usando el coeficiente de Dice.
 
-%% ---------- 1) RUTAS DE LOS ARCHIVOS ----------
-carpeta = fileparts(mfilename('fullpath'));
-if isempty(carpeta), carpeta = pwd; 
-    end   % si se pegó en la consola, uso la carpeta actual
+clear; clc; close all
 
-archCT    = fullfile(carpeta, 'CT.nii');                    % tomografía original
-archBrain = fullfile(carpeta, 'CQ500-CT-4_brain.nii');      % volumen sin cráneo
-archMask  = fullfile(carpeta, 'ICH_mask.nii');              % máscara de los médicos
+%% 1) Buscar los archivos del paciente dentro de Seg-CQ500
+DATASET  = fullfile(pwd, 'Seg-CQ500');   % carpeta del dataset (al lado de este script)
+PACIENTE = 1;                            % que paciente usar (1, 2, 3...)
 
-% Verifico que existan los tres; si falta uno, aviso cuál
-for a = {archCT, archBrain, archMask}
-    if ~isfile(a{1}), error('No encuentro el archivo: %s', a{1}); end
+% Busco todas las mascaras (una por paciente) en todas las subcarpetas
+mascaras = dir(fullfile(DATASET, '**', '*mask*.nii*'));
+if isempty(mascaras)
+    error('No encontre mascaras dentro de %s. Revisar la carpeta.', DATASET);
 end
 
-%% ---------- 2) LECTURA DE LOS VOLÚMENES ----------
-CT    = double(niftiread(archCT));      % pasa a double para poder filtrar y comparar
-brain = double(niftiread(archBrain));   % lo uso solo para saber dónde está el cerebro
-mask  = niftiread(archMask) > 0;        % máscara binaria (true = hemorragia)
-nZ    = size(CT, 3);                    % cantidad de cortes axiales
+% Muestro la lista de pacientes encontrados
+fprintf('Pacientes encontrados: %d\n', numel(mascaras));
+for k = 1:numel(mascaras)
+    fprintf('  %2d) %s\n', k, mascaras(k).folder);
+end
 
+% Carpeta del paciente elegido
+carpeta  = mascaras(PACIENTE).folder;
+archMask = fullfile(carpeta, mascaras(PACIENTE).name);
 
-%% ---------- 3) PARÁMETROS (lo único que hay que tocar) ----------
-P.usarBrain = true;   % true: el interior sale del volumen sin cráneo; false: lo calculo desde el CT
-P.huesoHU   = 100;    % umbral de hueso en HU (solo se usa si usarBrain = false)
-P.erosion   = 3;      % radio de erosión: me alejo del borde del cráneo (evita falsos positivos)
-P.delta     = 15;     % HU por encima del cerebro para considerar que es sangre
-P.techo     = 100;    % tope en HU: por encima ya es hueso o calcificación, no sangre
-P.rOpen     = 2;      % radio de la apertura morfológica (borra puntitos y hilos finos)
-P.minArea   = 30;     % tamaño mínimo (en píxeles) de un objeto para conservarlo
+% El CT es el .nii de la misma carpeta que no es mascara ni "brain"
+todos = dir(fullfile(carpeta, '*.nii*'));
+nombres = {todos.name};
+esCT = ~contains(nombres, 'mask', 'IgnoreCase', true) & ...
+       ~contains(nombres, 'brain', 'IgnoreCase', true);
+if ~any(esCT)
+    error('No encontre el CT en %s', carpeta);
+end
+archCT = fullfile(carpeta, nombres{find(esCT, 1)});
 
-%% ---------- 4) PRECÁLCULO POR CORTE ----------
-interior = false(size(CT));   % máscara del interior del cerebro, corte a corte
-cf       = zeros(size(CT));   % CT filtrado con mediana (reduce ruido)
-ref      = nan(nZ, 1);        % gris típico del cerebro de cada corte
-se       = strel('disk', P.erosion);   % elemento estructural para erosionar
+% Volumen sin craneo (solo se usa si usarBrain = true)
+b = dir(fullfile(carpeta, '*brain*.nii*'));
+archBrain = '';
+if ~isempty(b), archBrain = fullfile(carpeta, b(1).name); end
+
+fprintf('\nUsando paciente %d:\n  CT:      %s\n  Mascara: %s\n', ...
+    PACIENTE, archCT, archMask);
+
+%% 2) Parametros (lo unico que hay que tocar)
+usarBrain = false;  % false = sacamos el craneo nosotros desde el CT (todo propio)
+HUESO     = 100;    % HU: por encima es hueso
+EROSION   = 3;      % radio para alejarse del borde del craneo
+DELTA     = 15;     % HU por encima del cerebro para considerar sangre
+TECHO     = 100;    % HU: por encima ya no es sangre (hueso, calcificacion)
+R_OPEN    = 2;      % radio de la apertura morfologica
+AREA_MIN  = 30;     % pixeles: objetos mas chicos se descartan
+
+barrer    = true;   % true = probar varios DELTA
+mostrar3D = false;  % true = reconstruccion 3D (es lenta)
+
+%% 3) Leer los volumenes
+info = niftiinfo(archCT);
+CT   = double(niftiread(archCT));
+
+% Paso a HU con la escala del encabezado (niftiread no la aplica sola)
+pendiente = info.MultiplicativeScaling;
+if pendiente == 0, pendiente = 1; end        % 0 significa "sin escala"
+CT = CT * pendiente + info.AdditiveOffset;
+
+mask = niftiread(archMask) > 0;              % true = hemorragia
+if usarBrain
+    if isempty(archBrain), error('No hay volumen "brain" para este paciente.'); end
+    brain = double(niftiread(archBrain));
+end
+
+nZ = size(CT, 3);
+fprintf('Volumen %d x %d x %d | HU min = %.0f, max = %.0f\n', size(CT), min(CT(:)), max(CT(:)));
+% Control: el aire deberia estar cerca de -1000 HU y el hueso por encima de 300
+
+if ~isequal(size(CT), size(mask))
+    error('El CT y la mascara no tienen el mismo tamano.');
+end
+
+%% 4) Sacar el craneo y calcular el gris tipico del cerebro (corte por corte)
+interior = false(size(CT));   % donde esta el cerebro
+cf       = zeros(size(CT));   % CT filtrado con mediana
+ref      = nan(nZ, 1);        % gris tipico del cerebro en cada corte
 
 for z = 1:nZ
-    Cz = CT(:,:,z);   % corte z del CT
+    corte = CT(:,:,z);
 
-    % --- Defino el interior del cerebro ---
-    if P.usarBrain
-        % Todo lo que no es cero en el volumen "brain"; imfill tapa huecos internos
+    % Interior del cerebro
+    if usarBrain
         int = imfill(brain(:,:,z) > 0, 'holes');
     else
-        % Calculo el interior desde el CT: cráneo -> cierro anillo -> relleno -> resto el hueso
-        craneo = Cz > P.huesoHU;
-        disco  = imfill(imclose(craneo, strel('disk', 15)), 'holes');
-        int    = disco & ~craneo;
+        craneo = corte > HUESO;                                  % 1. hueso
+        disco  = imfill(imclose(craneo, strel('disk', 15)), 'holes'); % 2. cierro y relleno
+        int    = disco & ~craneo;                                % 3. adentro sin hueso
     end
-    if any(int(:)), int = bwareafilt(int, 1); end  % me quedo con el objeto más grande (el cerebro)
-    int = imerode(int, se);                        % achico un poco para alejarme del hueso
+    if any(int(:))
+        int = bwareafilt(int, 1);                % me quedo con el objeto mas grande
+    end
+    int = imerode(int, strel('disk', EROSION));  % me alejo del hueso
     interior(:,:,z) = int;
 
-    % --- Filtro de mediana 5x5: suaviza el ruido sin borrar bordes ---
-    cf(:,:,z) = medfilt2(Cz, [5 5]);
+    % Filtro de mediana: saca ruido sin borrar bordes
+    cf(:,:,z) = medfilt2(corte, [5 5]);
 
-    % --- Gris típico del cerebro en este corte (mediana dentro del interior) ---
+    % Gris tipico del cerebro de este corte
     if any(int(:))
-        tmp = cf(:,:,z);
+        tmp    = cf(:,:,z);
         ref(z) = median(tmp(int));
     end
 end
 
-%% ---------- 5) SEGMENTACIÓN DE TODO EL VOLUMEN ----------
-sangre = false(size(CT));   % resultado: máscara de sangre detectada
-for z = 1:nZ
-    sangre(:,:,z) = segmentar(cf(:,:,z), ref(z), interior(:,:,z), P);
-end
+%% 5) Segmentar la sangre en todo el volumen
+sangre = segmentarVolumen(cf, ref, interior, DELTA, TECHO, R_OPEN, AREA_MIN);
 
-% ---------- 6) EVALUACIÓN CON DICE ----------
-conMask = squeeze(any(any(mask, 1), 2));   % cortes donde los médicos marcaron hemorragia
+%% 6) Evaluar con Dice
+conMask = squeeze(any(any(mask, 1), 2));     % cortes donde los medicos marcaron sangre
 
-dice3D = 2*sum(sangre(:) & mask(:)) / max(sum(sangre(:)) + sum(mask(:)), 1);
+dice3D = calcDice(sangre, mask);             % volumen completo (cuenta TODOS los errores)
 
-% Dice por corte (solo cortes con hemorragia)
-diceZ = zeros(nZ, 1);
+diceZ = nan(nZ, 1);                          % Dice por corte, solo cortes con hemorragia
 for z = find(conMask)'
-    S = sangre(:,:,z);  M = mask(:,:,z);
-    diceZ(z) = 2*sum(S(:) & M(:)) / max(sum(S(:)) + sum(M(:)), 1);
+    diceZ(z) = calcDice(sangre(:,:,z), mask(:,:,z));
 end
 
-fprintf('\nDice 3D (volumen completo):          %.3f\n', dice3D);
-fprintf('Dice promedio (cortes con hemorr.):  %.3f\n', mean(diceZ(conMask)));
-fprintf('Voxeles: nuestro=%d, medicos=%d, acierto=%d\n', ...
+fprintf('\nDice 3D (volumen completo):        %.3f\n', dice3D);
+fprintf('Dice medio (cortes con hemorragia): %.3f\n', mean(diceZ, 'omitnan'));
+fprintf('Voxeles -> nuestro: %d | medicos: %d | acierto: %d\n', ...
     nnz(sangre), nnz(mask), nnz(sangre & mask));
 
 figure
-plot(find(conMask), diceZ(conMask), 'o-');
-xlabel('Corte'); 
-ylabel('Dice'); 
-title('Dice por corte'); 
-grid on
+plot(find(conMask), diceZ(conMask), 'o-'); grid on
+xlabel('Corte'); ylabel('Dice'); title('Dice por corte');
 
-%% ---------- 7) BARRIDO RÁPIDO DE DELTA ----------
-barrer = true;   % poner en false para saltear esta sección
+%% 7) Barrido de DELTA (evaluando el volumen completo)
 if barrer
     deltas = 5:5:40;
     dd = zeros(size(deltas));
     for i = 1:numel(deltas)
-        Q = P;  Q.delta = deltas(i);
-        S = false(size(CT));
-        for z = find(conMask)'
-            S(:,:,z) = segmentar(cf(:,:,z), ref(z), interior(:,:,z), Q);
-        end
-        A = S(:,:,conMask);  B = mask(:,:,conMask);
-        dd(i) = 2*sum(A(:) & B(:)) / max(sum(A(:)) + sum(B(:)), 1);
-        fprintf('delta = %2d -> Dice = %.3f\n', deltas(i), dd(i));
+        S = segmentarVolumen(cf, ref, interior, deltas(i), TECHO, R_OPEN, AREA_MIN);
+        dd(i) = calcDice(S, mask);
+        fprintf('DELTA = %2d -> Dice = %.3f\n', deltas(i), dd(i));
     end
-    figure, plot(deltas, dd, 'o-'); grid on
-    xlabel('DELTA (HU)'); ylabel('Dice'); title('Dice según DELTA');
+    figure
+    plot(deltas, dd, 'o-'); grid on
+    xlabel('DELTA (HU)'); ylabel('Dice 3D'); title('Dice segun DELTA');
     [~, k] = max(dd);
-    fprintf('Mejor DELTA: %d (Dice %.3f). Cargalo en P.delta y volvé a correr.\n', deltas(k), dd(k));
+    fprintf('Mejor DELTA: %d (Dice %.3f)\n', deltas(k), dd(k));
 end
 
-%% ---------- 8) VISOR: rojo = médicos, verde = nuestro ----------
-CTv = mat2gray(CT, [0 80]);        % ventana de cerebro (0 a 80 HU) escalada a 0..1 para mostrar
-z0  = find(conMask, 1);            % arranco en el primer corte con hemorragia
-if isempty(z0), z0 = round(nZ/2); end
+%% 8) Ver los cortes con mas hemorragia (rojo = medicos, verde = nuestro)
+CTv = mat2gray(CT, [0 80]);                  % ventana de cerebro para mostrar
 
-f  = figure('Name','Segmentación vs máscara','Position',[100 100 700 650]);
-ax = axes(f);
-% repmat a 3 canales para que visboundaries dibuje bien sobre la imagen
-h  = imshow(repmat(rot90(CTv(:,:,z0)), [1 1 3]), 'Parent', ax); hold(ax, 'on');
+area = squeeze(sum(sum(mask, 1), 2));        % cuanta hemorragia hay en cada corte
+[~, orden] = sort(area, 'descend');
+mostrar = orden(1:min(6, nnz(area)));        % hasta 6 cortes con mas sangre
 
-% Guardo en la figura todo lo que necesita el callback del slider
-d.CTv = CTv; d.mask = mask; d.sangre = sangre; d.diceZ = diceZ;
-d.ax = ax; d.h = h; d.nZ = nZ;
-f.UserData = d;
-
-% Slider para recorrer los cortes
-uicontrol('Style','slider','Min',1,'Max',nZ,'Value',z0, ...
-    'SliderStep',[1/(nZ-1) 5/(nZ-1)], 'Units','normalized', ...
-    'Position',[0.2 0.02 0.6 0.04], ...
-    'Callback', @(s,~) actualizar(f, round(s.Value)));
-actualizar(f, z0);   % dibujo el corte inicial
-reconstruir3D_suave('craneo')       % craneo, desde CT.nii
-reconstruir3D_suave('cerebro')      % cerebro, desde el volumen sin craneo
-reconstruir3D_suave('hemorragia')   % lo que marco el medico (ICH_mask.nii)
-reconstruir3D_suave('todo')         % las tres juntas
-%% ============ FUNCIONES LOCALES ============
-
-function sangre = segmentar(cf, ref, interior, P)
-    % Segmenta la sangre de UN corte con el método relativo.
-    sangre = false(size(cf));                          % por defecto, nada
-    if isnan(ref) || ~any(interior(:)), return; end    % corte sin cerebro válido: salgo
-
-    % Más claro que el cerebro del corte (+delta), menos que el techo, y solo dentro del cerebro
-    sangre = (cf > ref + P.delta) & (cf < P.techo) & interior;
-
-    % Apertura: erosiona y dilata, borra puntitos y hilos finos
-    if P.rOpen > 0, sangre = imopen(sangre, strel('disk', P.rOpen)); end
-    % Cierre: une zonas de sangre cercanas y tapa pequeños cortes
-    sangre = imclose(sangre, strel('disk', 3));
-    % Relleno: tapa agujeros dentro de cada región de sangre
-    sangre = imfill(sangre, 'holes');
-    % Descarto objetos más chicos que minArea
-    sangre = bwareaopen(sangre, P.minArea);
+figure('Name', 'Segmentacion vs mascara')
+for i = 1:numel(mostrar)
+    z = mostrar(i);
+    subplot(2, 3, i)
+    imshow(rot90(CTv(:,:,z))); hold on
+    visboundaries(rot90(mask(:,:,z)),   'Color', 'r');
+    if any(sangre(:,:,z), 'all')
+        visboundaries(rot90(sangre(:,:,z)), 'Color', 'g');
+    end
+    title(sprintf('Corte %d | Dice = %.2f', z, diceZ(z)));
 end
 
-function actualizar(f, z)
-    % Callback del slider: redibuja el corte z con los contornos.
-    d = f.UserData;
-    d.h.CData = repmat(rot90(d.CTv(:,:,z)), [1 1 3]);   % imagen del corte
-    delete(findobj(d.ax, 'Type', 'line'));              % borro contornos del corte anterior
-    m = rot90(d.mask(:,:,z));                           % máscara de médicos (misma rotación)
-    s = rot90(d.sangre(:,:,z));                         % nuestra segmentación
-    if any(m(:)), visboundaries(d.ax, m, 'Color', 'r'); end   % rojo = médicos
-    if any(s(:)), visboundaries(d.ax, s, 'Color', 'g'); end   % verde = nuestro
-    title(d.ax, sprintf('Corte %d/%d | Dice = %.3f', z, d.nZ, d.diceZ(z)));
+%% 9) Reconstruccion 3D (opcional)
+if mostrar3D
+    reconstruir3D_suave('todo')
+end
+
+%% ============ FUNCIONES ============
+
+function sangre = segmentarVolumen(cf, ref, interior, DELTA, TECHO, R_OPEN, AREA_MIN)
+    % Aplica la segmentacion corte por corte a todo el volumen
+    sangre = false(size(cf));
+    for z = 1:size(cf, 3)
+        if isnan(ref(z)), continue; end      % corte sin cerebro: lo salteo
+
+        % 1. Mas claro que el cerebro (+DELTA), menos que el techo, solo adentro
+        s = (cf(:,:,z) > ref(z) + DELTA) & (cf(:,:,z) < TECHO) & interior(:,:,z);
+
+        % 2. Limpieza morfologica
+        if R_OPEN > 0
+            s = imopen(s, strel('disk', R_OPEN));   % borra puntitos e hilos
+        end
+        s = imclose(s, strel('disk', 3));           % une zonas cercanas
+        s = imfill(s, 'holes');                      % tapa agujeros
+        s = bwareaopen(s, AREA_MIN);                 % saca objetos chicos
+
+        sangre(:,:,z) = s;
+    end
+end
+
+function d = calcDice(A, B)
+    % Dice: 1 = coincidencia perfecta, 0 = nada en comun
+    d = 2 * nnz(A & B) / max(nnz(A) + nnz(B), 1);
 end
