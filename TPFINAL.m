@@ -1,223 +1,273 @@
-%% Tp Final PDI
-T = readtable('hemorrhage_diagnosis.csv');   % tabla: un renglon por corte
-head(T)    % muestra SOLO los primeros renglones
+%% TP Final PDI - Segmentacion de hemorragia en CT (Seg-CQ500, NIfTI)
+% En cada corte, la sangre es lo que es mas claro que el cerebro tipico de ESE
+% corte (mediana) + DELTA. Pasos:
+%   1. Cerebro: adentro del craneo, a mas de MARGEN mm del hueso (3D), objeto 3D mas grande
+%   2. Sangre: mas claro que el gris del corte + DELTA y menos que TECHO
+%   3. Limpieza 2D (apertura, cierre, relleno) y 3D (espesor minimo GROSOR_MIN mm)
+%   4. Histeresis: cada objeto necesita algun punto mas denso que el cerebro + NUCLEO
+% Se compara con la mascara de los medicos (Dice), se guardan las dos mascaras por
+% separado y se abre un visor. Solo para evaluar: naranja = falso positivo (objeto
+% nuestro que no toca ninguno de los medicos), azul = falso negativo (hemorragia de
+% los medicos que no toca ninguno de los nuestros).
 
-conH = T(T.No_Hemorrhage == 0, :);   % solo los renglones donde SOLO hay hemorragia
-conH(1:30 , {'PatientNumber', 'SliceNumber'}) ;  % paciente y corte de los primeros 30 con hemorragia
+clear; clc; close all
 
-%% Primer corte con hemorragia de la lista
-p = conH.PatientNumber(15);       % numero de paciente
-s = conH.SliceNumber(15);         % numero de corte
+%% 1) Parametros
+DATASET    = fullfile(pwd, 'Seg-CQ500');    % carpeta del dataset (al lado de este script)
+RESULTADOS = fullfile(pwd, 'resultados');   % aca se guardan las mascaras separadas
+CTS        = [55  249 90 227 95];           % numero de CT del CQ500 (carpeta CQ500CT227, ...)
+HUESO      = 100;    % HU: por encima es hueso
+MARGEN     = 6;      % mm: distancia minima al hueso, en 3D
+DELTA      = 15;     % HU por encima del cerebro para considerar sangre
+TECHO      = 100;    % HU: por encima ya no es sangre
+R_OPEN     = 2;      % pixeles: radio de la apertura en cada corte
+GROSOR_MIN = 4;      % mm: espesor minimo en 3D (0 = sin filtro 3D)
+NUCLEO     = 25;     % HU sobre el cerebro que necesita algun punto de cada objeto
+guardar    = true;   % guarda las dos mascaras (.nii.gz) y la tabla de Dice
+barrer     = false;  % prueba varios DELTA en todas las CT (tarda mas)
+deltas     = 5:5:40;
+%El dice que mejor queda es el de margen 10 y grosor 4 
+%% 2) Buscar las mascaras y el numero de CT de cada una
+mascaras = dir(fullfile(DATASET, '**', '*mask*.nii*'));
+if isempty(mascaras), error('No encontre mascaras dentro de %s.', DATASET); end
+nums = cellfun(@(t) str2double(char(t)), regexpi(strcat({mascaras.folder}, filesep, ...
+       {mascaras.name}), 'CQ500[-_ ]*CT[-_ ]*(\d+)', 'tokens', 'once'));
+if guardar && ~exist(RESULTADOS, 'dir'), mkdir(RESULTADOS); end
 
-%% Cargo imagenes
-[Ibrain, M] = cargar(p, s);       % ventana de cerebro y mascara de los medicos
-Ihueso = imread(fullfile('Patients_CT', sprintf('%03d', p), 'bone', sprintf('%d.jpg', s)));
+%% 3) Procesar cada CT
+res = {};  tabla = [];  dd = [];
+for ct = CTS
+    k = find(nums == ct, 1);
+    if isempty(k), warning('No encontre la CT %d.', ct); continue; end
+    t0 = tic;  carpeta = mascaras(k).folder;  archMask = fullfile(carpeta, mascaras(k).name);
 
-%% Muestro Imagenes
-figure
-subplot(1,3,1);
-imshow(Ibrain);
-title(sprintf('Paciente %d, corte %d', p, s));
+    % Leer el CT en HU (el .nii de la carpeta que no es mascara ni "brain") y la mascara
+    f = dir(fullfile(carpeta, '*.nii*'));
+    f = f(~contains({f.name}, {'mask', 'brain'}, 'IgnoreCase', true));
+    info = niftiinfo(fullfile(carpeta, f(1).name));
+    m = info.MultiplicativeScaling;  if m == 0, m = 1; end       % 0 = "sin escala"
+    CT   = double(niftiread(info)) * m + info.AdditiveOffset;
+    mask = niftiread(archMask) > 0;                               % medicos
+    esp  = reshape(double(info.PixelDimensions(1:3)), 1, 3);      % voxel en mm
 
-subplot(1,3,2);
-imshow(Ihueso);
-title('Ventana de hueso');
+    % Nuestra mascara
+    [interior, cf, ref] = prepararVolumen(CT, esp, HUESO, MARGEN);
+    sangre = segmentar(cf, ref, interior, esp, DELTA, TECHO, R_OPEN, GROSOR_MIN, NUCLEO);
 
-subplot(1,3,3);
-imshow(Ibrain)
-hold on
-visboundaries(M, 'Color', 'r');  
-title('Hemorragia marcada');
+    % Evaluar: Dice 3D, Dice medio en los cortes con hemorragia, falsos positivos y negativos
+    diceZ = arrayfun(@(z) calcDice(sangre(:,:,z), mask(:,:,z)), find(squeeze(any(any(mask, 1), 2)))');
+    fp = sangre & ~mask;
+    fn = mask & ~sangre;             % de los medicos que no encontramos
+    mL = prod(esp) / 1000;                                        % mL de un voxel
+    tabla(end+1, :) = [ct, calcDice(sangre, mask), mean(diceZ), nnz(mask) * mL, nnz(sangre) * mL, ...
+                       nnz(fp) * mL, nnz(fn) * mL];
+    fprintf(['CT %d: Dice 3D %.3f | por corte %.3f | medicos %.1f mL | nuestra %.1f mL | ' ...
+             'falso positivo %.1f mL | falso negativo %.1f mL (%.0f s)\n'], tabla(end, :), toc(t0));
 
-size(Ibrain)                      
-figure
-imshow(Ibrain)
-hold on
-visboundaries(M, 'Color', 'r');    
-impixelinfo         
-
-%% segmentacion de hueso y cerebro y hemorragia
-[interior, cf, ref, craneo, disco] = segmentar_cerebro(Ibrain);
-cerebro = Ibrain;  
-cerebro(~interior) = 0;
-
-figure
-subplot(2,2,1);
-imshow(craneo);
-title('1) Hueso (>240)');
-
-subplot(2,2,2);
-imshow(disco);
-title('2) Relleno');
-
-subplot(2,2,3);
-imshow(interior);
-title('3) Interior')
-
-subplot(2,2,4);
-imshow(cerebro);
-hold on
-visboundaries(M, 'Color', 'r');
-title('4) Cerebro sin cráneo + hemorragia')
-
-% veo que porcentaje de la hemorragia quedo adentro de la mascara del cerebro:
-porc = 100 * sum(M(:) & interior(:)) / sum(M(:))
-
-%% Histograma: sangre vs cerebro sano
-figure
-histogram(cerebro(M & interior), 0:255, 'Normalization','pdf')
-hold on
-histogram(cerebro(~M & interior), 0:255, 'Normalization','pdf')
-legend('Sangre','Cerebro sano');
-xlabel('Nivel de gris');
-
-%% Segmento sangre (método umbralizado directo)
-cf = medfilt2(cerebro, [5 5]); 
-sangre = (cf > 150) & (cf < 215) & interior; % rango de la sangre, solo adentro del cerebro
-sangre = bwareaopen(sangre, 50);           % saco puntitos chicos
-
-% Comparo con la máscara de los médicos (Dice: 1 = perfecto, 0 = nada)
-dice = 2*sum(sangre(:) & M(:)) / max(sum(sangre(:)) + sum(M(:)), 1)
-
-figure, imshow(Ibrain), hold on
-visboundaries(M, 'Color', 'r')        % rojo = médicos
-visboundaries(sangre, 'Color', 'g')   % verde = nuestro
-title(sprintf('Paciente %d, corte %d | Dice = %.2f', p, s, dice));
-
-%% Veo porque dice me dan tan chico:
-nuestro = sum(sangre(:))
-medicos = sum(M(:))
-acierto = sum(sangre(:) & M(:))
-
-%% Segmento sangre con DELTA y R_OPEN
-% DELTA define qué tan más clara debe ser la sangre en comparación con el cerebro sano del mismo corte
-% Ropen es el radio de un disco para una apertura morfologica
-
-DELTA  = 35;      
-R_OPEN = 2;       
-sangre_opt = umbralizar(cf, ref, interior, DELTA, R_OPEN);
-dice_opt = 2*sum(sangre_opt(:) & M(:)) / max(sum(sangre_opt(:)) + sum(M(:)), 1);
-
-figure, imshow(Ibrain), hold on
-visboundaries(M, 'Color','r');           % rojo = medicos
-visboundaries(sangre_opt, 'Color','g');  % verde = nuestro
-title(sprintf('Optimizado | Paciente %d, corte %d | Dice = %.2f', p, s, dice_opt));
-drawnow
-
-%% Mejores DELTA y R_OPEN para cada tipo 
-tipos_nombres = {'Intraventricular','Intraparenchymal','Subarachnoid','Epidural','Subdural'};
-N_por_tipo = 20;                 % cortes por tipo (inf = todos)
-DELTAs = 0:5:80;
-ROPENs = 0:5;
-nT = numel(tipos_nombres);
-
-% me creo un array con solo cortes con un unico tipo de hemorragia
-sumaT = zeros(height(conH),1);
-for i = 1:nT, sumaT = sumaT + conH.(tipos_nombres{i}); end
-unico = conH(sumaT == 1, :);
-
-%pongo vectores vacios para ir asignandoles los mejores valores
-DELTA_opt = nan(nT,1);  
-ROPEN_opt = nan(nT,1);  
-Dice_max = nan(nT,1);  
-nCortes = zeros(nT,1);
-
-for i = 1:nT
-
-    sub = unico(unico.(tipos_nombres{i}) == 1, :);% esto es para no agarrar toooodos los cortes 
-    if height(sub) > N_por_tipo
-        sub = sub(round(linspace(1, height(sub), N_por_tipo)), :);
-    end
-    C = cargar_set(sub);                         % cada corte se carga una sola vez
-    nCortes(i) = numel(C);
-    if isempty(C), continue; 
-    end
-    Dm = nan(numel(DELTAs), numel(ROPENs));      % Dice para cada combinacion
-    for a = 1:numel(DELTAs)
-        for b = 1:numel(ROPENs)
-            Dm(a,b) = dice_set(C, DELTAs(a), ROPENs(b));
-        end
-    end % hasta aca lo que hago es ver la combinación de los Ropen y Delta para obtener el mejor dice
-    [Dice_max(i), idx] = max(Dm(:)); %aca obtengo el mas alto
-    [a, b] = ind2sub(size(Dm), idx);
-    DELTA_opt(i) = DELTAs(a);  
-    ROPEN_opt(i) = ROPENs(b);
-    fprintf('%-18s DELTA=%d apertura=%d -> Dice=%.3f (%d cortes)\n', ...
-        tipos_nombres{i}, DELTA_opt(i), ROPEN_opt(i), Dice_max(i), nCortes(i));
-end
-
-resumen = table(tipos_nombres', nCortes, DELTA_opt, ROPEN_opt, Dice_max, ...
-    'VariableNames', {'Tipo','Cortes','DELTA','Apertura','Dice'});
-disp(resumen)
-
-%% Funciones auxiliares
-function [I, M] = cargar(p, s)
-    % lee la imagen en ventana de cerebro y la mascara de los medicos
-    carpeta = fullfile('Patients_CT', sprintf('%03d', p), 'brain');
-    I = imread(fullfile(carpeta, sprintf('%d.jpg', s)));
-    M = imread(fullfile(carpeta, sprintf('%d_HGE_Seg.jpg', s)));
-    if size(I,3) > 1, I = rgb2gray(I); end
-    if size(M,3) > 1, M = M(:,:,1); end
-    M = M > 128;
-end
-
-function [interior, cf, ref, craneo, disco] = segmentar_cerebro(I)
-    craneo  = I > 240;
-    cerrado = imclose(craneo, strel('disk', 15));  % tapa los huecos del anillo
-    disco   = imfill(cerrado, 'holes');
-    
-    interior0 = disco & ~craneo;
-    interior0 = bwareafilt(interior0, 1);
-    
-    if ~any(interior0(:))               % no se encontro el cerebro
-        interior = false(size(I));
-        cf = [];
-        ref = NaN;
-        return; 
-    end
-    
-    interior = imerode(interior0, strel('disk', 2));
-    if ~any(interior(:))
-        cf = [];
-        ref = NaN;
-        return; 
-    end
-    
-    cf  = medfilt2(I, [5 5]);
-    ref = median(double(cf(interior)));   % gris tipico del cerebro de ESTE corte
-end
-
-function sangre = umbralizar(cf, ref, interior, DELTA, rOpen)
-    sangre = false(size(cf));
-    if isnan(ref) || isempty(cf), return; end
-    sangre = (cf > ref + DELTA) & (cf < 245) & interior;   % mas claro que el cerebro
-    if rOpen > 0, sangre = imopen(sangre, strel('disk', rOpen)); end
-    sangre = imclose(sangre, strel('disk', 3));
-    sangre = imfill(sangre, 'holes');
-    sangre = bwareaopen(sangre, 30);
-end
-
-function C = cargar_set(sub)
-    % carga una vez todos los cortes de la lista (los que fallan se saltean)
-    C = {};
-    for k = 1:height(sub)
+    % Guardar las dos mascaras por separado, con el encabezado de la de los medicos
+    if guardar
         try
-            [I, M] = cargar(sub.PatientNumber(k), sub.SliceNumber(k));
-            [int, cf, ref] = segmentar_cerebro(I);
-            if any(M(:)) && ~isnan(ref)
-                C{end+1} = struct('M', M, 'int', int, 'cf', cf, 'ref', ref);
-            end
-        catch
-        end
+            im = niftiinfo(archMask);
+            im.Datatype = 'uint8';  im.BitsPerPixel = 8;  im.ImageSize = size(mask);
+            im.PixelDimensions = im.PixelDimensions(1:3);
+            niftiwrite(uint8(mask),   fullfile(RESULTADOS, sprintf('CT%d_medicos', ct)), im, 'Compressed', true);
+            niftiwrite(uint8(sangre), fullfile(RESULTADOS, sprintf('CT%d_nuestra', ct)), im, 'Compressed', true);
+        catch err, warning('No pude guardar las mascaras de la CT %d: %s', ct, err.message); end
+    end
+    if barrer       % Dice 3D para cada DELTA
+        dd(end+1, :) = arrayfun(@(D) calcDice(segmentar(cf, ref, interior, esp, D, TECHO, ...
+                                R_OPEN, GROSOR_MIN, NUCLEO), mask), deltas);
+    end
+
+    res{end+1} = prepararVisor(tabla(end, :), CT, mask, sangre, fp, fn, interior, esp, info, HUESO);
+    clear CT cf interior sangre mask fp fn                        % libero memoria
+end
+if isempty(res), error('No se pudo procesar ninguna CT.'); end
+
+%% 4) Resumen (y barrido de DELTA si barrer = true)
+resumen = array2table(tabla, 'VariableNames', ...
+    {'CT', 'Dice3D', 'DiceCortes', 'VolMedicos_mL', 'VolNuestra_mL', 'FalsoPositivo_mL', 'FalsoNegativo_mL'});
+disp(resumen)
+fprintf('Promedio: Dice 3D %.3f | Dice por corte %.3f\n', mean(tabla(:, 2)), mean(tabla(:, 3), 'omitnan'));
+if guardar, writetable(resumen, fullfile(RESULTADOS, 'resumen_dice.csv')); end
+if barrer
+    figure('Name', 'Dice segun DELTA');  grid on;  hold on
+    plot(deltas, dd', 'o-', deltas, mean(dd, 1), 'k-', 'LineWidth', 1.5);
+    xlabel('DELTA (HU)');  ylabel('Dice 3D');
+    legend([arrayfun(@(c) sprintf('CT %d', c), tabla(:, 1), 'UniformOutput', false); {'Promedio'}]);
+    [mejor, i] = max(mean(dd, 1));
+    fprintf('Mejor DELTA en promedio: %d (Dice %.3f)\n', deltas(i), mejor);
+end
+
+%% 5) Visor: una CT por vez (3D y cortes), Medicos | Nuestra
+visor(res);
+
+%% ============ FUNCIONES ============
+
+function [interior, cf, ref] = prepararVolumen(CT, esp, HUESO, MARGEN)
+    % Cerebro (interior), CT filtrado con mediana (cf) y gris tipico de cada corte (ref)
+    nZ = size(CT, 3);
+    hueso = mayor3D(imreconstruct(CT > 300, CT > HUESO));    % > HUESO pegado a hueso denso (un coagulo no cuenta)
+    cerca = imdilate(hueso, strel('cuboid', 2 * round(MARGEN ./ esp) + 1));   % a menos de MARGEN mm, en 3D
+    interior = false(size(CT));  cf = CT;
+    for z = 1:nZ
+        disco = imfill(imclose(hueso(:,:,z), strel('disk', 15)), 'holes');   % craneo cerrado y relleno
+        interior(:,:,z) = disco & ~cerca(:,:,z);                             % adentro y lejos del hueso
+        cf(:,:,z) = medfilt2(CT(:,:,z), [5 5]);                              % saca ruido sin borrar bordes
+    end
+    interior = mayor3D(interior);                   % objeto 3D mas grande: saca los huecos de la base
+    ref = nan(nZ, 1);
+    for z = 1:nZ, c = cf(:,:,z);  ref(z) = median(c(interior(:,:,z))); end   % NaN si no hay cerebro
+end
+
+function sangre = segmentar(cf, ref, interior, esp, DELTA, TECHO, R_OPEN, GROSOR_MIN, NUCLEO)
+    R = reshape(ref, 1, 1, []);                                        % gris del cerebro de cada corte
+    s = (cf > R + DELTA) & (cf < TECHO) & interior;                    % 1. umbral relativo
+    s = imclose(imopen(s, strel('disk', R_OPEN)), strel('disk', 3));   % 2. limpieza en cada corte
+    for z = 1:size(s, 3), s(:,:,z) = imfill(s(:,:,z), 'holes'); end
+    s = s & zonaGruesa(s, esp, GROSOR_MIN);                            % 3. espesor minimo en 3D
+    sangre = imreconstruct(s & (cf > R + NUCLEO), s);                  % 4. histeresis: nucleo denso
+end
+
+function zona = zonaGruesa(S, esp, G)
+    % Zona alrededor de donde entra una esfera de G mm de diametro (en una grilla de
+    % 1 mm, para que sea redonda). Venas, hoz y rayas son finas: ahi no entra.
+    if G <= 0 || ~any(S(:)), zona = true(size(S)); return; end
+    S1     = imresize3(uint8(S) * 255, round(size(S) .* esp), 'linear') > 127;
+    nucleo = bwdist(~S1) > G / 2;              % centros donde entra la esfera
+    zona1  = bwdist(nucleo) <= G;              % alrededor del nucleo (recupera el borde)
+    zona   = imresize3(uint8(zona1), size(S), 'nearest') > 0;
+end
+
+function BW = mayor3D(BW)
+    % Se queda con el objeto 3D mas grande
+    cc = bwconncomp(BW);
+    if cc.NumObjects == 0, return; end
+    [~, k] = max(cellfun(@numel, cc.PixelIdxList));
+    BW = false(size(BW));  BW(cc.PixelIdxList{k}) = true;
+end
+
+function d = calcDice(A, B)
+    d = 2 * nnz(A & B) / max(nnz(A) + nnz(B), 1);   % 1 = coincidencia perfecta, 0 = nada en comun
+end
+
+function r = prepararVisor(datos, CT, mask, sangre, fp, fn, interior, esp, info, HUESO)
+    % Superficies 3D (en mm) y cortes 2D que usa el visor
+    r.datos = datos;                     % [CT Dice3D DiceCortes VolMed VolNuestra FalsoPos FalsoNeg]
+    p = max(1, round(size(CT, 1) / 128));  pz = max(1, round(p * esp(1) / esp(3)));
+    baja = @(V) V(1:p:end, 1:p:end, 1:pz:end);       % craneo y cerebro: alcanza con menos resolucion
+    r.fv = [superficie(mask & ~fn, esp), superficie(fn, esp), ...         % 1 medicos, 2 falso negativo
+            superficie(sangre & ~fp, esp), superficie(fp, esp), ...       % 3 nuestra, 4 falso positivo
+            superficie(imfill(baja(interior), 'holes'), esp .* [p p pz]), ...   % 5 cerebro
+            superficie(mayor3D(baja(CT) > HUESO), esp .* [p p pz])];          % 6 craneo
+    V = vertcat(r.fv.vertices);
+    r.lim = [min(V, [], 1); max(V, [], 1)]' + [-5 5];                    % limites de los ejes
+    r.invertirZ = false;  try, r.invertirZ = info.Transform.T(3, 3) < 0; catch, end
+
+    % Cortes con hemorragia (medicos o nuestra), recortados alrededor del cerebro
+    r.zz = find(squeeze(any(any(mask | sangre, 1), 2)));
+    if isempty(r.zz), r.zz = round(size(CT, 3) / 2); end
+    [f, c] = find(any(interior | mask, 3));
+    f = max(min(f) - 20, 1):min(max(f) + 20, size(CT, 1));
+    c = max(min(c) - 20, 1):min(max(c) + 20, size(CT, 2));
+    r.ct2D  = im2uint8(mat2gray(CT(f, c, r.zz), [0 80]));               % ventana de cerebro
+    r.med2D = uint8(mask(f, c, r.zz)) + uint8(fn(f, c, r.zz));          % 1 encontrada, 2 falso negativo
+    r.nue2D = uint8(sangre(f, c, r.zz)) + uint8(fp(f, c, r.zz));        % 1 coincide, 2 falso positivo
+    r.diceZ = arrayfun(@(z) calcDice(sangre(:,:,z), mask(:,:,z)), r.zz);
+    [~, r.kIni] = max(squeeze(sum(sum(r.med2D > 0, 1), 2)));           % arranca en el corte con mas sangre
+end
+
+function fv = superficie(M, esp)
+    % Superficie 3D suavizada de una mascara M, con vertices en mm
+    fv = struct('faces', zeros(0, 3), 'vertices', zeros(0, 3));
+    if ~any(M(:)), return; end
+    [f, c, s] = ind2sub(size(M), find(M));                              % recorto a la caja del objeto
+    lo = max([min(f) min(c) min(s)] - 2, 1);  hi = min([max(f) max(c) max(s)] + 2, size(M));
+    sub = padarray(M(lo(1):hi(1), lo(2):hi(2), lo(3):hi(3)), [1 1 1]);
+    sup = isosurface(smooth3(double(sub), 'gaussian'), 0.5);
+    if isempty(sup.vertices), return; end
+    if size(sup.faces, 1) > 20000, sup = reducepatch(sup, 20000); end   % rota mas fluido
+    fv.faces    = sup.faces;
+    fv.vertices = (sup.vertices + lo([2 1 3]) - 3) .* esp([2 1 3]);     % indices -> mm (x = columna)
+end
+
+function visor(res)
+    % Ventana: 3D Medicos | 3D Nuestra | cortes, con botones Anterior / Siguiente
+    fig = figure('Name', 'Medicos vs Nuestra', 'NumberTitle', 'off', 'Color', 'w', ...
+                 'Units', 'normalized', 'OuterPosition', [0.03 0.05 0.94 0.9]);
+    d = struct('res', {res}, 'k', 1, 'ax3D', gobjects(1, 2), 'link', []);
+    d.ax2D = [axes('Parent', fig, 'Position', [0.68 0.53 0.30 0.36]), ...
+              axes('Parent', fig, 'Position', [0.68 0.11 0.30 0.36])];
+    d.titulo = uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [0.02 0.94 0.96 0.04], ...
+                         'BackgroundColor', 'w', 'FontSize', 13, 'FontWeight', 'bold');
+    uicontrol(fig, 'String', '< Anterior', 'Units', 'normalized', 'Position', [0.18 0.02 0.12 0.05], ...
+              'FontSize', 11, 'Callback', @(s, ~) dibujarPaciente(ancestor(s, 'figure'), -1));
+    uicontrol(fig, 'String', 'Siguiente >', 'Units', 'normalized', 'Position', [0.36 0.02 0.12 0.05], ...
+              'FontSize', 11, 'Callback', @(s, ~) dibujarPaciente(ancestor(s, 'figure'), 1));
+    d.slider = uicontrol(fig, 'Style', 'slider', 'Units', 'normalized', 'Position', [0.70 0.035 0.26 0.03], ...
+                         'Min', 1, 'Max', 2, 'Value', 1, 'Callback', @(s, ~) dibujarCortes(ancestor(s, 'figure')));
+    d.rot = rotate3d(fig);  d.rot.Enable = 'on';     % rotar con el mouse (solo los 3D)
+    guidata(fig, d);
+    dibujarPaciente(fig, 0);
+end
+
+function dibujarPaciente(fig, paso)
+    % Pasa a otra CT (paso = -1 / +1) y dibuja los dos 3D y la barra de cortes
+    d = guidata(fig);  d.k = mod(d.k - 1 + paso, numel(d.res)) + 1;  r = d.res{d.k};
+    d.titulo.String = sprintf('CT %d  (%d de %d)      Dice 3D = %.3f      Dice medio por corte = %.3f', ...
+                              r.datos(1), d.k, numel(d.res), r.datos(2), r.datos(3));
+    vista = [-37.5 30];                              % mantengo el angulo de la CT anterior
+    if isgraphics(d.ax3D(1)), [az, el] = view(d.ax3D(1));  vista = [az el];  delete(d.ax3D); end
+
+    % Superficies: 1 medicos (rojo), 2 falso negativo (azul), 3 nuestra (verde),
+    %              4 falso positivo (naranja), 5 cerebro, 6 craneo
+    colores = [0.85 0.10 0.10; 0.20 0.40 1.00; 0.10 0.65 0.20; 1.00 0.55 0.00; ...
+               0.50 0.50 0.65; 0.70 0.65 0.55];
+    alfas   = [1 1 1 1 0.12 0.10];                   % opacidad
+    capas   = {[6 5 1 2], [6 5 3 4]};                % que se dibuja en cada panel
+    titulos = {{sprintf('Medicos: %.1f mL', r.datos(4)), sprintf('azul = falso negativo: %.1f mL', r.datos(7))}, ...
+               {sprintf('Nuestra: %.1f mL', r.datos(5)), sprintf('naranja = falso positivo: %.1f mL', r.datos(6))}};
+    for j = 1:2
+        ax = axes('Parent', fig, 'Position', [0.01 + 0.33 * (j - 1), 0.11, 0.32, 0.78]);
+        pintar(ax, r.fv(capas{j}), colores(capas{j}, :), alfas(capas{j}));
+        light('Parent', ax, 'Position', [1 1 1], 'Style', 'infinite');
+        light('Parent', ax, 'Position', [-1 -1 -1], 'Style', 'infinite');
+        set(ax, 'XLim', r.lim(1, :), 'YLim', r.lim(2, :), 'ZLim', r.lim(3, :), ...
+                'DataAspectRatio', [1 1 1], 'Visible', 'off');
+        if r.invertirZ, ax.ZDir = 'reverse'; end
+        view(ax, vista);  axis(ax, 'vis3d');  title(ax, titulos{j}, 'FontSize', 12);
+        d.ax3D(j) = ax;
+    end
+    d.link = linkprop(d.ax3D, {'CameraPosition', 'CameraUpVector'});    % giran juntos
+
+    n = numel(r.zz);  d.slider.Value = 1;            % la barra recorre los cortes con hemorragia
+    if n > 1, set(d.slider, 'Max', n, 'Value', r.kIni, 'SliderStep', min([1 5] / (n - 1), 1), 'Enable', 'on');
+    else,     set(d.slider, 'Max', 2, 'Enable', 'off'); end
+    guidata(fig, d);
+    dibujarCortes(fig);
+end
+
+function pintar(ax, fv, colores, alfas)
+    % Dibuja cada superficie de fv que no este vacia, con su color y opacidad
+    for i = find(arrayfun(@(s) ~isempty(s.faces), fv))
+        patch('Parent', ax, 'Faces', fv(i).faces, 'Vertices', fv(i).vertices, 'FaceColor', colores(i, :), ...
+              'FaceAlpha', alfas(i), 'EdgeColor', 'none', 'FaceLighting', 'gouraud', ...
+              'AmbientStrength', 0.5, 'SpecularStrength', 0.2);
     end
 end
 
-function dm = dice_set(C, DELTA, rOpen)
-    % Dice promedio sobre los cortes ya cargados
-    d = nan(numel(C),1);
-    for k = 1:numel(C)
-        sk = umbralizar(C{k}.cf, C{k}.ref, C{k}.int, DELTA, rOpen);
-        d(k) = 2*sum(sk(:) & C{k}.M(:)) / max(sum(sk(:)) + sum(C{k}.M(:)), 1);
-    end
-    dm = mean(d, 'omitnan');
+function dibujarCortes(fig)
+    % Corte elegido con la barra: Medicos arriba (azul = falso negativo),
+    % Nuestra abajo (naranja = falso positivo)
+    d = guidata(fig);  r = d.res{d.k};
+    i = min(max(round(d.slider.Value), 1), numel(r.zz));
+    if strcmp(d.slider.Enable, 'on'), d.slider.Value = i; end
+    img = rot90(r.ct2D(:,:,i));
+    imshow(labeloverlay(img, rot90(r.med2D(:,:,i)), 'Colormap', [1 0 0; 0.2 0.4 1], 'Transparency', 0.5), ...
+           'Parent', d.ax2D(1));
+    imshow(labeloverlay(img, rot90(r.nue2D(:,:,i)), 'Colormap', [0 0.8 0; 1 0.55 0], 'Transparency', 0.5), ...
+           'Parent', d.ax2D(2));
+    title(d.ax2D(1), sprintf('Medicos | corte %d  (%d de %d)', r.zz(i), i, numel(r.zz)));
+    title(d.ax2D(2), sprintf('Nuestra | Dice del corte = %.2f', r.diceZ(i)));
+    setAllowAxesRotate(d.rot, d.ax2D, false);        % los cortes no se rotan
 end
